@@ -4,7 +4,7 @@ defmodule Pow.Extension.Ecto.Schema do
 
   The macro will append fields to the `@pow_fields` module attribute using the
   attributes from `[Pow Extension].Ecto.Schema.attrs/1`, so they can be used in
-  the `Pow.Ecto.Schema.pow_user_fields/0` method call.
+  the `Pow.Ecto.Schema.pow_user_fields/0` function call.
 
   After module compilation `[Pow Extension].Ecto.Schema.validate!/2` will run.
 
@@ -32,7 +32,7 @@ defmodule Pow.Extension.Ecto.Schema do
       end
   """
   alias Ecto.Changeset
-  alias Pow.{Config, Extension}
+  alias Pow.{Config, Extension, Extension.Base}
 
   defmodule SchemaError do
     @moduledoc false
@@ -48,7 +48,7 @@ defmodule Pow.Extension.Ecto.Schema do
 
       unquote(__MODULE__).__register_extension_fields__()
       unquote(__MODULE__).__register_extension_assocs__()
-      unquote(__MODULE__).__pow_extension_methods__()
+      unquote(__MODULE__).__pow_extension_functions__()
       unquote(__MODULE__).__register_after_compile_validation__()
     end
   end
@@ -56,8 +56,7 @@ defmodule Pow.Extension.Ecto.Schema do
   @doc false
   def __use_extensions__(config) do
     config
-    |> schema_modules()
-    |> Enum.filter(&Kernel.macro_exported?(&1, :__using__, 1))
+    |> schema_modules_with_use()
     |> Enum.map(fn module ->
       quote do
         use unquote(module), unquote(config)
@@ -68,8 +67,8 @@ defmodule Pow.Extension.Ecto.Schema do
   @doc false
   defmacro __register_extension_fields__ do
     quote do
-      for attr <- unquote(__MODULE__).attrs(@pow_extension_config) do
-        Module.put_attribute(__MODULE__, :pow_fields, attr)
+      for {name, value, options, _migration_options} <- unquote(__MODULE__).attrs(@pow_extension_config) do
+        Module.put_attribute(__MODULE__, :pow_fields, {name, value, options})
       end
     end
   end
@@ -80,17 +79,16 @@ defmodule Pow.Extension.Ecto.Schema do
       @pow_extension_config
       |> unquote(__MODULE__).assocs()
       |> Enum.map(fn
-        {:belongs_to, name, :users} -> {:belongs_to, name, __MODULE__}
-        {:has_many, name, :users, opts} -> {:has_many, name, __MODULE__, opts}
+        {type, name, :users, field_options, _migration_options} -> {type, name, __MODULE__, field_options}
+        {type, name, module, field_options, _migration_options} -> {type, name, module, field_options}
       end)
       |> Enum.each(&Module.put_attribute(__MODULE__, :pow_assocs, &1))
     end
   end
 
   @doc false
-  defmacro __pow_extension_methods__ do
+  defmacro __pow_extension_functions__ do
     quote do
-      @spec pow_extension_changeset(Changeset.t(), map()) :: Changeset.t()
       def pow_extension_changeset(changeset, attrs) do
         unquote(__MODULE__).changeset(changeset, attrs, @pow_extension_config)
       end
@@ -100,11 +98,11 @@ defmodule Pow.Extension.Ecto.Schema do
   @doc false
   defmacro __register_after_compile_validation__ do
     quote do
-      def validate_after_compilation!(env, _bytecode) do
+      def pow_extension_validate_after_compilation!(env, _bytecode) do
         unquote(__MODULE__).validate!(@pow_extension_config, __MODULE__)
       end
 
-      @after_compile {__MODULE__, :validate_after_compilation!}
+      @after_compile {__MODULE__, :pow_extension_validate_after_compilation!}
     end
   end
 
@@ -124,7 +122,12 @@ defmodule Pow.Extension.Ecto.Schema do
 
       Enum.concat(attrs, extension_attrs)
     end)
+    |> Enum.map(&normalize_attr/1)
   end
+
+  defp normalize_attr({name, value}), do: {name, value, [], []}
+  defp normalize_attr({name, value, field_options}), do: {name, value, field_options, []}
+  defp normalize_attr({name, value, field_options, migration_options}), do: {name, value, field_options, migration_options}
 
   @doc """
   Merge all extension associations together to one list.
@@ -142,7 +145,12 @@ defmodule Pow.Extension.Ecto.Schema do
 
       Enum.concat(assocs, extension_assocs)
     end)
+    |> Enum.map(&normalize_assoc/1)
   end
+
+  defp normalize_assoc({type, name, module}), do: {type, name, module, [], []}
+  defp normalize_assoc({type, name, module, field_options}), do: {type, name, module, field_options, []}
+  defp normalize_assoc({type, name, module, field_options, migration_options}), do: {type, name, module, field_options, migration_options}
 
   @doc """
   Merge all extension indexes together to one list.
@@ -182,10 +190,10 @@ defmodule Pow.Extension.Ecto.Schema do
   This will run `validate!/2` on all extension ecto schema modules.
 
   It's used to ensure certain fields are available, e.g. an `:email` field. The
-  method should either raise an exception, or return `:ok`. Compilation will
+  function should either raise an exception, or return `:ok`. Compilation will
   fail when the exception is raised.
   """
-  @spec validate!(Config.t(), atom()) :: :ok | no_return
+  @spec validate!(Config.t(), atom()) :: :ok
   def validate!(config, module) do
     config
     |> schema_modules()
@@ -195,7 +203,16 @@ defmodule Pow.Extension.Ecto.Schema do
   end
 
   defp schema_modules(config) do
-    Extension.Config.discover_modules(config, ["Ecto", "Schema"])
+    config
+    |> Extension.Config.extensions()
+    |> Extension.Config.extension_modules(["Ecto", "Schema"])
+  end
+
+  defp schema_modules_with_use(config) do
+    config
+    |> Extension.Config.extensions()
+    |> Enum.filter(&Base.use?(&1, ["Ecto", "Schema"]))
+    |> Enum.map(&Module.concat([&1] ++ ["Ecto", "Schema"]))
   end
 
   @doc """
@@ -203,7 +220,7 @@ defmodule Pow.Extension.Ecto.Schema do
 
   If the field doesn't exist, it'll raise an exception.
   """
-  @spec require_schema_field!(atom(), atom(), atom()) :: :ok | no_return
+  @spec require_schema_field!(atom(), atom(), atom()) :: :ok
   def require_schema_field!(module, field, extension) do
     fields = module.__schema__(:fields)
 
@@ -211,11 +228,11 @@ defmodule Pow.Extension.Ecto.Schema do
     |> Enum.member?(field)
     |> case do
       true  -> :ok
-      false -> raise_missing_field_error(module, field, extension)
+      false -> raise_missing_field_error!(module, field, extension)
     end
   end
 
-  defp raise_missing_field_error(module, field, extension) do
-    raise SchemaError, message: "A `#{inspect field}` schema field should be defined in #{inspect module} to use #{inspect extension}"
-  end
+  @spec raise_missing_field_error!(module(), atom(), atom()) :: no_return()
+  defp raise_missing_field_error!(module, field, extension),
+    do: raise SchemaError, message: "A `#{inspect field}` schema field should be defined in #{inspect module} to use #{inspect extension}"
 end

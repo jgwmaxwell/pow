@@ -40,42 +40,20 @@ defmodule Pow.Phoenix.Controller do
 
       plug :pow_layout, unquote(config)
 
-      @doc """
-      See `Pow.Phoenix.Controller.action/3` for more.
-      """
-      @spec action(Conn.t(), Keyword.t()) :: Conn.t()
-      def action(conn, _opts) do
-        unquote(__MODULE__).action(__MODULE__, conn, conn.params)
-      end
+      def action(conn, _opts), do: unquote(__MODULE__).action(__MODULE__, conn, conn.params)
 
       defp pow_layout(conn, _config), do: ViewHelpers.layout(conn)
 
-      unquote(__MODULE__).__define_helper_methods__()
+      unquote(__MODULE__).__define_helper_functions__()
     end
   end
 
   @doc false
-  defmacro __define_helper_methods__ do
+  defmacro __define_helper_functions__ do
     quote do
-      @doc """
-      See `Pow.Phoenix.Controller.messages/2` for more.
+      def messages(conn), do: unquote(__MODULE__).messages(conn, Messages)
 
-      `Pow.Phoenix.Messages` is used as fallback.
-      """
-      @spec messages(Conn.t()) :: atom()
-      def messages(conn) do
-        unquote(__MODULE__).messages(conn, Messages)
-      end
-
-      @doc """
-      See `Pow.Phoenix.Controller.routes/2` for more.
-
-      `Pow.Phoenix.Routes` is used as fallback.
-      """
-      @spec routes(Conn.t()) :: atom()
-      def routes(conn) do
-        unquote(__MODULE__).routes(conn, Routes)
-      end
+      def routes(conn), do: unquote(__MODULE__).routes(conn, Routes)
 
       defoverridable messages: 1, routes: 1
     end
@@ -90,8 +68,8 @@ defmodule Pow.Phoenix.Controller do
   """
   @spec action(atom(), Conn.t(), map()) :: Conn.t()
   def action(controller, %{private: private} = conn, params) do
-    action    = private.phoenix_action
-    config    = Plug.fetch_config(conn)
+    action = private.phoenix_action
+    config = Plug.fetch_config(conn)
     callbacks = Config.get(config, :controller_callbacks)
 
     conn
@@ -101,6 +79,7 @@ defmodule Pow.Phoenix.Controller do
     |> respond_action(controller, action)
   end
 
+  defp process_action({:halt, conn}, _controller, _action, _params), do: {:halt, conn}
   defp process_action(conn, controller, action, params) do
     apply(controller, String.to_atom("process_#{action}"), [conn, params])
   end
@@ -110,6 +89,8 @@ defmodule Pow.Phoenix.Controller do
     apply(controller, String.to_atom("respond_#{action}"), [results])
   end
 
+  defp maybe_callback({:halt, conn}, _callbacks, _hook, _controller, _action, _config),
+    do: {:halt, conn}
   defp maybe_callback(results, nil, _hook, _controller, _action, _config), do: results
   defp maybe_callback(results, callbacks, hook, controller, action, config) do
     apply(callbacks, hook, [controller, action, results, config])

@@ -27,6 +27,36 @@ defmodule Pow.Extension.Phoenix.Router do
           pow_extension_routes()
         end
       end
+
+  ## Customize Pow extension routes
+
+  Pow extension routes can be overridden by defining them before the
+  `pow_extension_routes/0` call. As an example, this can be used to change
+  path:
+
+      defmodule MyAppWeb.Router do
+        use MyAppWeb, :router
+        use Pow.Phoenix.Router
+        use Pow.Extension.Phoenix.Router,
+          extensions: [PowExtensionOne, PowExtensionTwo]
+
+        # ...
+
+        scope "/", PowExtensionOne.Phoenix, as: "pow_extension_one" do
+          pipe_through [:browser]
+
+          resources "/pow_extension_one", SomeController, only: [:new, :create]
+        end
+
+        scope "/" do
+          pipe_through :browser
+
+          pow_routes()
+          pow_extension_routes()
+        end
+
+        # ...
+      end
   """
   alias Pow.{Extension.Config, Phoenix.Router}
 
@@ -42,7 +72,7 @@ defmodule Pow.Extension.Phoenix.Router do
   end
 
   @doc """
-  A macro that will call the router method in all extension router modules.
+  A macro that will call the routes function in all extension router modules.
   """
   defmacro pow_extension_routes do
     router_module(__CALLER__.module).routes()
@@ -74,6 +104,8 @@ defmodule Pow.Extension.Phoenix.Router do
 
   @doc false
   def __router_modules__(config) do
-    Config.discover_modules(config, ["Phoenix", "Router"])
+    config
+    |> Config.extensions()
+    |> Config.extension_modules(["Phoenix", "Router"])
   end
 end

@@ -1,6 +1,6 @@
 # Custom controllers
 
-*Please note that if you just wish to modify the templates, then you should follow the [Modify templates](../README.md#modify-templates) section(s) in the README. This guide is meant for allowing complete control over flow.*
+_Please note that if you just wish to modify the templates, then you should follow the [Modify templates](../README.md#modify-templates) section(s) in the README. This guide is meant for allowing complete control over flow._
 
 Pow makes it easy to use custom controllers leveraging the underlying Pow logic. It is ideal for cases where you need to control the flow, e.g., protect the registration process in a certain way.
 
@@ -8,7 +8,7 @@ First you should follow the [Getting Started](../README.md#getting-started) sect
 
 ## Routes
 
-Modify your `lib/my_app_web/router.ex` to use your custom session and registration controllers instead of the default Pow controllers:
+Modify your `WEB_PATH/router.ex` to set up the Pow plugs in `:protected` and `:not_authenticated` pipelines with a custom error handler, and add the routes for your custom session and registration controllers:
 
 ```elixir
 defmodule MyAppWeb.Router do
@@ -45,7 +45,7 @@ defmodule MyAppWeb.Router do
 end
 ```
 
-And create `lib/my_app_web/auth_error_handler.ex`:
+And create `WEB_PATH/auth_error_handler.ex`:
 
 ```elixir
 defmodule MyAppWeb.AuthErrorHandler do
@@ -74,7 +74,7 @@ This module will make sure that unauthenticated user can't log out, and authenti
 
 We'll be using `Pow.Plug` for the heavy lifting, and customizing the response handling in our controllers.
 
-Create `lib/my_app_web/controllers/registration_controller.ex`:
+Create `WEB_PATH/controllers/registration_controller.ex`:
 
 ```elixir
 defmodule MyAppWeb.RegistrationController do
@@ -111,7 +111,7 @@ defmodule MyAppWeb.RegistrationController do
 end
 ```
 
-Create `lib/my_app_web/controllers/session_controller.ex`:
+Create `WEB_PATH/controllers/session_controller.ex`:
 
 ```elixir
 defmodule MyAppWeb.SessionController do
@@ -142,36 +142,36 @@ defmodule MyAppWeb.SessionController do
   end
 
   def delete(conn, _params) do
-    {:ok, conn} = Pow.Plug.clear_authenticated_user(conn)
-
-    redirect(conn, to: Routes.page_path(conn, :index))
+    conn
+    |> Pow.Plug.delete()
+    |> redirect(to: Routes.page_path(conn, :index))
   end
 end
 ```
 
 ### Templates
 
-Create `lib/my_app_web/templates/registration/new.html.eex`:
+Create `WEB_PATH/templates/registration/new.html.eex`:
 
 ```elixir
 <%= form_for @changeset, Routes.signup_path(@conn, :create), fn f -> %>
-  <%= label f, :email, "email" %>
+  <%= label f, :email %>
   <%= email_input f, :email %>
   <%= error_tag f, :email %>
 
-  <%= label f, :password, "password" %>
+  <%= label f, :password %>
   <%= password_input f, :password %>
   <%= error_tag f, :password %>
 
-  <%= label f, :confirm_password, "confirm_password" %>
-  <%= password_input f, :confirm_password %>
-  <%= error_tag f, :confirm_password %>
+  <%= label f, :password_confirmation %>
+  <%= password_input f, :password_confirmation %>
+  <%= error_tag f, :password_confirmation %>
 
   <%= submit "Register" %>
 <% end %>
 ```
 
-Create `lib/my_app_web/templates/session/new.html.eex`:
+Create `WEB_PATH/templates/session/new.html.eex`:
 
 ```elixir
 <h1>Log in</h1>
@@ -183,13 +183,13 @@ Create `lib/my_app_web/templates/session/new.html.eex`:
 <% end %>
 ```
 
-Remember to create the view files `lib/my_app_web/views/registration_view.ex` and `lib/my_app_web/views/session_view.ex` too.
+Remember to create the view files `WEB_PATH/views/registration_view.ex` and `WEB_PATH/views/session_view.ex` too.
 
 ## Further customization
 
 That's all you need to do to have custom controllers with Pow! From here on you can customize your flow.
 
-You may want to utilize some of the extensions, but since you have created a custom controller, it's highly recommended that you do not rely on any controller methods in the extensions. Instead, you should implement the logic yourself to keep your controllers as explicit as possible. This is only an example:
+You may want to utilize some of the extensions, but since you have created a custom controller, it's highly recommended that you do not rely on any controller actions in the extensions. Instead, you should implement the logic yourself to keep your controllers as explicit as possible. This is only an example:
 
 ```elixir
 defmodule MyAppWeb.SessionController do
@@ -213,7 +213,7 @@ defmodule MyAppWeb.SessionController do
 
       false ->
         conn
-        |> Pow.Plug.clear_authenticated_user()
+        |> Pow.Plug.delete()
         |> put_flash(:info, "Your e-mail address has not been confirmed.")
         |> redirect(to: Routes.login_path(conn, :new))
     end

@@ -3,6 +3,21 @@ defmodule Pow.Ecto.Schema.Password do
   Simple wrapper for password hash and verification.
 
   The password hash format is based on [Pbkdf2](https://github.com/riverrun/pbkdf2_elixir)
+
+  ## Configuration
+
+  This module can be configured by setting the `Pow.Ecto.Schema.Password` key
+  for the `:pow` app:
+
+      config :pow, Pow.Ecto.Schema.Password,
+        iterations: 100_000,
+        length: 64,
+        digest: :sha512,
+        salt_length: 16
+
+  For test environment it's recommended to set the iteration to 1:
+
+      config :pow, Pow.Ecto.Schema.Password, iterations: 1
   """
   alias Pow.Ecto.Schema.Password.Pbkdf2
 
@@ -71,7 +86,7 @@ defmodule Pow.Ecto.Schema.Password do
         [digest, iterations, salt, hash]
 
       _ ->
-        raise_not_valid_password_hash()
+        raise_not_valid_password_hash!()
     end
   end
 
@@ -82,7 +97,7 @@ defmodule Pow.Ecto.Schema.Password do
     Pbkdf2.compare(hash, secret_hash)
   end
 
-  defp raise_not_valid_password_hash do
-    raise ArgumentError, "not a valid encoded password hash"
-  end
+  @spec raise_not_valid_password_hash!() :: no_return()
+  defp raise_not_valid_password_hash!,
+    do: raise ArgumentError, "not a valid encoded password hash"
 end

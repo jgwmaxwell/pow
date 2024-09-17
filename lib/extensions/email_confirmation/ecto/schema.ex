@@ -52,6 +52,18 @@ defmodule PowEmailConfirmation.Ecto.Schema do
     [{:email_confirmation_token, true}]
   end
 
+  @doc false
+  @impl true
+  defmacro __using__(_config) do
+    quote do
+      def confirm_email_changeset(changeset, attrs), do: pow_confirm_email_changeset(changeset, attrs)
+
+      defdelegate pow_confirm_email_changeset(changeset, attrs), to: unquote(__MODULE__), as: :confirm_email_changeset
+
+      defoverridable confirm_email_changeset: 2
+    end
+  end
+
   @doc """
   Handles e-mail confirmation if e-mail is updated.
 
@@ -84,10 +96,12 @@ defmodule PowEmailConfirmation.Ecto.Schema do
       email_changed?(changeset) ->
         current_email = changeset.data.email
         changed_email = Changeset.get_field(changeset, :email)
+        changeset     = set_unconfirmed_email(changeset, current_email, changed_email)
 
-        changeset
-        |> put_email_confirmation_token()
-        |> set_unconfirmed_email(current_email, changed_email)
+        case unconfirmed_email_changed?(changeset) do
+          true -> put_email_confirmation_token(changeset)
+          false -> changeset
+        end
 
       true ->
         changeset
@@ -105,10 +119,10 @@ defmodule PowEmailConfirmation.Ecto.Schema do
   end
 
   defp email_changed?(changeset) do
-    changed_email     = Changeset.get_change(changeset, :email)
-    unconfirmed_email = changeset.data.unconfirmed_email
-
-    changed_email && changed_email != unconfirmed_email
+    case Changeset.get_change(changeset, :email) do
+      nil  -> false
+      _any -> true
+    end
   end
 
   defp put_email_confirmation_token(changeset) do
@@ -121,20 +135,12 @@ defmodule PowEmailConfirmation.Ecto.Schema do
     changeset
     |> Changeset.put_change(:email, current_email)
     |> Changeset.put_change(:unconfirmed_email, new_email)
-    |> Changeset.prepare_changes(&validate_unique_email/1)
   end
 
-  defp validate_unique_email(changeset) do
-    opts = Keyword.take(changeset.repo_opts, [:prefix])
-    unconfirmed_email = Changeset.get_change(changeset, :unconfirmed_email)
-    unique_email_changeset =
-      changeset
-      |> Changeset.put_change(:email, unconfirmed_email)
-      |> Changeset.unsafe_validate_unique(:email, changeset.repo, opts)
-
-    case unique_email_changeset.valid? do
-      true  -> changeset
-      false -> unique_email_changeset
+  defp unconfirmed_email_changed?(changeset) do
+    case Changeset.get_change(changeset, :unconfirmed_email) do
+      nil  -> false
+      _any -> true
     end
   end
 
@@ -147,21 +153,21 @@ defmodule PowEmailConfirmation.Ecto.Schema do
   If the struct has a `:unconfirmed_email` value, then the `:email` will be
   changed to this value, and `:unconfirmed_email` will be set to nil.
   """
-  @spec confirm_email_changeset(Ecto.Schema.t() | Changeset.t()) :: Changeset.t()
-  def confirm_email_changeset(%Changeset{data: %{unconfirmed_email: unconfirmed_email}} = changeset) when not is_nil(unconfirmed_email) do
-    confirm_email(changeset, unconfirmed_email)
+  @spec confirm_email_changeset(Ecto.Schema.t() | Changeset.t(), map()) :: Changeset.t()
+  def confirm_email_changeset(%Changeset{data: %{unconfirmed_email: unconfirmed_email}} = changeset, params) when not is_nil(unconfirmed_email) do
+    confirm_email(changeset, unconfirmed_email, params)
   end
-  def confirm_email_changeset(%Changeset{data: %{email_confirmed_at: confirmed_at, email: email}} = changeset) when is_nil(confirmed_at) do
-    confirm_email(changeset, email)
+  def confirm_email_changeset(%Changeset{data: %{email_confirmed_at: nil, email: email}} = changeset, params) do
+    confirm_email(changeset, email, params)
   end
-  def confirm_email_changeset(%Changeset{} = changeset), do: changeset
-  def confirm_email_changeset(user) do
+  def confirm_email_changeset(%Changeset{} = changeset, _params), do: changeset
+  def confirm_email_changeset(user, params) do
     user
     |> Changeset.change()
-    |> confirm_email_changeset()
+    |> confirm_email_changeset(params)
   end
 
-  defp confirm_email(changeset, email) do
+  defp confirm_email(changeset, email, _params) do
     confirmed_at = Pow.Ecto.Schema.__timestamp_for__(changeset.data.__struct__, :email_confirmed_at)
     changes      =
       [
@@ -175,4 +181,9 @@ defmodule PowEmailConfirmation.Ecto.Schema do
     |> Changeset.change(changes)
     |> Changeset.unique_constraint(:email)
   end
+
+  # TODO: Remove by 1.1.0
+  @deprecated "Use `confirm_email_changeset/2` instead"
+  @doc false
+  def confirm_email_changeset(changeset), do: confirm_email_changeset(changeset, %{})
 end

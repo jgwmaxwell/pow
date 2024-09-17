@@ -1,12 +1,11 @@
 defmodule Pow.Plug do
   @moduledoc """
-  Plug helper methods.
+  Plug helper functions.
   """
   alias Plug.Conn
-  alias Pow.{Config, Operations}
+  alias Pow.{Config, Operations, Plug.MessageVerifier}
 
   @private_config_key :pow_config
-
 
   @doc """
   Get the current user assigned to the conn.
@@ -64,8 +63,8 @@ defmodule Pow.Plug do
   It'll raise an error if configuration hasn't been set as a private key.
   """
   @spec fetch_config(Conn.t()) :: Config.t()
-  def fetch_config(%Conn{private: private}) do
-    private[@private_config_key] || no_config_error()
+  def fetch_config(%{private: private}) do
+    private[@private_config_key] || no_config_error!()
   end
 
   @doc """
@@ -96,19 +95,15 @@ defmodule Pow.Plug do
     |> Operations.authenticate(config)
     |> case do
       nil  -> {:error, conn}
-      user -> {:ok, get_plug(config).do_create(conn, user, config)}
+      user -> {:ok, create(conn, user, config)}
     end
   end
 
-  @doc """
-  Clears the user authentication from the session.
-  """
+  # TODO: Remove by 1.1.0
+  @doc false
+  @deprecated "Use `delete/1` instead"
   @spec clear_authenticated_user(Conn.t()) :: {:ok, Conn.t()}
-  def clear_authenticated_user(conn) do
-    config = fetch_config(conn)
-
-    {:ok, get_plug(config).do_delete(conn, config)}
-  end
+  def clear_authenticated_user(conn), do: {:ok, delete(conn)}
 
   @doc """
   Creates a changeset from the current authenticated user.
@@ -165,13 +160,13 @@ defmodule Pow.Plug do
     |> current_user(config)
     |> Operations.delete(config)
     |> case do
-      {:ok, user}         -> {:ok, user, get_plug(config).do_delete(conn, config)}
+      {:ok, user}         -> {:ok, user, delete(conn, config)}
       {:error, changeset} -> {:error, changeset, conn}
     end
   end
 
   defp maybe_create_auth({:ok, user}, conn, config) do
-    {:ok, user, get_plug(config).do_create(conn, user, config)}
+    {:ok, user, create(conn, user, config)}
   end
   defp maybe_create_auth({:error, changeset}, conn, _config) do
     {:error, changeset, conn}
@@ -185,16 +180,89 @@ defmodule Pow.Plug do
 
   @spec get_plug(Config.t()) :: atom()
   def get_plug(config) do
-    config[:plug] || no_plug_error()
+    config[:plug] || no_plug_error!()
   end
 
-  @spec no_config_error :: no_return
-  defp no_config_error do
-    Config.raise_error("Pow configuration not found in connection. Please use a Pow plug that puts the Pow configuration in the plug connection.")
+  @doc """
+  Call `create/3` for the Pow plug set for the `conn`.
+  """
+  @spec create(Conn.t(), map()) :: Conn.t()
+  def create(conn, user), do: create(conn, user, fetch_config(conn))
+
+  @spec create(Conn.t(), map(), Config.t()) :: Conn.t()
+  def create(conn, user, config), do: get_plug(config).do_create(conn, user, config)
+
+  @doc """
+  Call `delete/2` for the Pow plug set for the `conn`.
+  """
+  @spec delete(Conn.t()) :: Conn.t()
+  def delete(conn), do: delete(conn, fetch_config(conn))
+
+  @spec delete(Conn.t(), Config.t()) :: Conn.t()
+  def delete(conn, config), do: get_plug(config).do_delete(conn, config)
+
+  @spec no_config_error!() :: no_return()
+  defp no_config_error!,
+    do: Config.raise_error("Pow configuration not found in connection. Please use a Pow plug that puts the Pow configuration in the plug connection.")
+
+  @spec no_plug_error!() :: no_return()
+  defp no_plug_error!,
+    do: Config.raise_error("Pow plug was not found in config. Please use a Pow plug that puts the `:plug` in the Pow configuration.")
+
+  @doc false
+  @spec __prevent_user_enumeration__(Conn.t(), any()) :: boolean()
+  def __prevent_user_enumeration__(%{private: %{pow_prevent_user_enumeration: false}}, _changeset), do: false
+  def __prevent_user_enumeration__(_conn, %{errors: errors}), do: unique_constraint_error?(errors, :email)
+  def __prevent_user_enumeration__(_conn, _any), do: true
+
+  defp unique_constraint_error?(errors, field) do
+    Enum.find_value(errors, false, fn
+      {^field, {_msg, [constraint: :unique, constraint_name: _name]}} -> true
+      _any                                                            -> false
+    end)
   end
 
-  @spec no_plug_error :: no_return
-  defp no_plug_error do
-    Config.raise_error("Pow plug was not found in config. Please use a Pow plug that puts the `:plug` in the Pow configuration.")
+  @doc """
+  Signs a token for public consumption.
+
+  Used to prevent timing attacks with token lookup.
+
+  This uses `Pow.Plug.MessageVerifier` by default, but can be changed if the
+  Pow configuration is set with `:message_verifier`. `Pow.Plug.MessageVerifier`
+  can also be configured in this way if `:message_verifier` is set to
+  `{Pow.Plug.MessageVerifier, key_generator_opts: [length: 64]}`
+  """
+
+  @spec sign_token(Conn.t(), binary(), binary(), Config.t() | nil) :: binary()
+  def sign_token(conn, salt, token, config \\ nil) do
+    config           = config || fetch_config(conn)
+    {module, config} = message_verifier_module(config)
+
+    module.sign(conn, salt, token, config)
+  end
+
+  @doc """
+  Decodes and verifies a token.
+
+  Used to prevent timing attacks with token lookup.
+
+  This uses `Pow.Plug.MessageVerifier` by default, but can be changed if the
+  Pow configuration is set with `:message_verifier`. `Pow.Plug.MessageVerifier`
+  can also be configured in this way if `:message_verifier` is set to
+  `{Pow.Plug.MessageVerifier, key_generator_opts: [length: 64]}`
+  """
+  @spec verify_token(Conn.t(), binary(), binary(), Config.t() | nil) :: {:ok, binary()} | :error
+  def verify_token(conn, salt, token, config \\ nil) do
+    config           = config || fetch_config(conn)
+    {module, config} = message_verifier_module(config)
+
+    module.verify(conn, salt, token, config)
+  end
+
+  defp message_verifier_module(config) do
+    case Config.get(config, :message_verifier, MessageVerifier) do
+      {module, config} -> {module, config}
+      module           -> {module, []}
+    end
   end
 end

@@ -1,5 +1,9 @@
 defmodule PowEmailConfirmation.Phoenix.Messages do
-  @moduledoc false
+  @moduledoc """
+  Module that handles messages for PowEmailConfirmation.
+
+  See `Pow.Extension.Phoenix.Messages` for more.
+  """
 
   @doc """
   Flash message to show when email has been confirmed.
@@ -10,6 +14,12 @@ defmodule PowEmailConfirmation.Phoenix.Messages do
   Flash message to show when email couldn't be confirmed.
   """
   def email_confirmation_failed(_conn), do: "The email address couldn't be confirmed."
+
+
+  @doc """
+  Flash message to show when a invalid confirmation link is used.
+  """
+  def invalid_token(_conn), do: "The confirmation token is invalid or has expired."
 
   @doc """
   Flash message to show when user is signs in or registers but e-mail is yet

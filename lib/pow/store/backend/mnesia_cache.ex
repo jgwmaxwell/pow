@@ -2,9 +2,9 @@ defmodule Pow.Store.Backend.MnesiaCache do
   @moduledoc """
   GenServer based key value Mnesia cache store with auto expiration.
 
-  When the MnesiaCache starts, it'll initialize invalidators for all stored
-  keys using the `expire` value. If the `expire` datetime is past, it'll
-  send call the invalidator immediately.
+  When the MnesiaCache starts, it will initialize invalidators for all stored
+  keys using the `expire` value. If the `expire` datetime is past, it will
+  call the invalidator immediately.
 
   Mnesia will create a `Mnesia.Node` directory in the current working directory
   to write files to. This can be changed by setting the `-mnesia dir` config:
@@ -14,16 +14,22 @@ defmodule Pow.Store.Backend.MnesiaCache do
   The directory path should be accessible, otherwise MnesiaCache will crash on
   startup.
 
+  `:mnesia` should be added to `:extra_applications` in `mix.exs` for it to be
+  included in releases.
+
   ## Distribution
 
   The MnesiaCache is built to handle multi-node setup.
 
-  If you initialize with `extra_db_nodes: Node.list()`, it'll automatically
-  connect to the cluster. If there is no other nodes available, the data
-  persisted to disk will be loaded, but if a cluster is running, the data in
-  the existing cluster nodes will be loaded instead of the local data. This
-  could potentially cause data loss, but is an accepted risk as all data stored
-  by Pow should be ephemeral.
+  If you initialize with `extra_db_nodes: Node.list()`, it will automatically
+  connect to the cluster. You can also use MFA:
+  `extra_db_nodes: {Node, :list, []}`. This is useful for when nodes are
+  dynamically connected before MnesiaCache startup in the supervision tree.
+
+  If there is no other nodes available, the data persisted to disk will be
+  loaded, but if a cluster is running, the data in the existing cluster nodes
+  will be loaded instead of the local data. This could potentially cause data
+  loss, but is an accepted risk as all data stored by Pow should be ephemeral.
 
   When a cache key expires, the expiration will be verified before deletion to
   ensure that it hasn't been updated by another node. When a key is updated on
@@ -43,9 +49,9 @@ defmodule Pow.Store.Backend.MnesiaCache do
 
   ## Usage
 
-  To start the GenServer, add it to your application `start/2` method:
+  To start the GenServer, add it to your application `start/2` function:
 
-      defmodule MyAppWeb.Application do
+      defmodule MyApp.Application do
         use Application
 
         def start(_type, _args) do
@@ -54,7 +60,7 @@ defmodule Pow.Store.Backend.MnesiaCache do
             MyAppWeb.Endpoint,
             Pow.Store.Backend.MnesiaCache
             # # Or in a distributed system:
-            # {Pow.Store.Backend.MnesiaCache, extra_db_nodes: Node.list()},
+            # {Pow.Store.Backend.MnesiaCache, extra_db_nodes: {Node, :list, []}},
             # Pow.Store.Backend.MnesiaCache.Unsplit # Recover from netsplit
           ]
 
@@ -65,9 +71,12 @@ defmodule Pow.Store.Backend.MnesiaCache do
         # ...
       end
 
+  Update configuration with `cache_store_backend: Pow.Store.Backend.MnesiaCache`.
+
   ## Initialization options
 
-    * `:extra_db_nodes` - list of nodes in cluster to connect to.
+    * `:extra_db_nodes` - list of nodes or MFA returning a list of nodes in
+      cluster to connect to.
 
     * `:table_opts` - options to add to table definition. This value defaults
       to `[disc_copies: [node()]]`.
@@ -81,16 +90,19 @@ defmodule Pow.Store.Backend.MnesiaCache do
 
     * `:namespace` - string value to use for namespacing keys, defaults to
       "cache".
+
+    * `:writes` - set to `:async` to do asynchronous writes. Defaults to
+      `:sync`.
   """
   use GenServer
-  alias Pow.{Config, Store.Base}
+  alias Pow.{Config, Store.Backend.Base}
 
   require Logger
 
   @behaviour Base
   @mnesia_cache_tab __MODULE__
 
-  @spec start_link(Config.t()) :: GenServer.on_start()
+  @spec start_link(Base.config()) :: GenServer.on_start()
   def start_link(config) do
     # TODO: Remove by 1.1.0
     case Config.get(config, :nodes) do
@@ -102,187 +114,203 @@ defmodule Pow.Store.Backend.MnesiaCache do
   end
 
   @impl Base
-  @spec put(Config.t(), binary(), any()) :: :ok
-  def put(config, key, value) do
-    GenServer.cast(__MODULE__, {:cache, config, key, value, ttl(config)})
+  def put(config, record_or_records) do
+    ttl = ttl!(config)
+
+    case Config.get(config, :writes, :sync) do
+      :sync ->
+        records = table_insert(record_or_records, ttl, config)
+        GenServer.cast(__MODULE__, {:append_validators, config, records, ttl})
+
+      :async ->
+        GenServer.cast(__MODULE__, {:cache, config, record_or_records, ttl})
+    end
   end
 
   @impl Base
-  @spec delete(Config.t(), binary()) :: :ok
   def delete(config, key) do
-    GenServer.cast(__MODULE__, {:delete, config, key})
+    case Config.get(config, :writes, :sync) do
+      :sync ->
+        key = table_delete(key, config)
+        GenServer.cast(__MODULE__, {:clear_invalidator, config, key})
+
+      :async ->
+        GenServer.cast(__MODULE__, {:delete, config, key})
+    end
   end
 
   @impl Base
-  @spec get(Config.t(), binary()) :: any() | :not_found
   def get(config, key) do
-    table_get(config, key)
+    table_get(key, config)
   end
 
   @impl Base
-  @spec keys(Config.t()) :: [any()]
-  def keys(config) do
-    table_keys(config)
+  def all(config, match) do
+    table_all(match, config)
   end
 
   # Callbacks
 
   @impl GenServer
-  @spec init(Config.t()) :: {:ok, map()}
   def init(config) do
-    init_mnesia(config)
+    case init_mnesia(config) do
+      :ok ->
+        {:ok, %{invalidators: init_invalidators(config)}}
 
-    {:ok, %{invalidators: init_invalidators(config)}}
+      {:error, error} ->
+        {:stop, error}
+    end
   end
 
   @impl GenServer
-  @spec handle_cast({:cache, Config.t(), binary(), any(), integer()}, map()) :: {:noreply, map()}
-  def handle_cast({:cache, config, key, value, ttl}, %{invalidators: invalidators} = state) do
-    table_update(config, key, value, ttl)
+  def handle_cast({:append_validators, config, records, ttl}, %{invalidators: invalidators} = state) do
+    invalidators =
+      Enum.reduce(records, invalidators, fn {key, _}, invalidators ->
+        append_invalidator(key, invalidators, ttl, config)
+      end)
 
-    invalidators = update_invalidators(config, invalidators, key, ttl)
     refresh_invalidators_in_cluster(config)
 
     {:noreply, %{state | invalidators: invalidators}}
   end
 
-  @spec handle_cast({:delete, Config.t(), binary()}, map()) :: {:noreply, map()}
-  def handle_cast({:delete, config, key}, %{invalidators: invalidators} = state) do
-    invalidators = clear_invalidator(invalidators, key)
-    table_delete(config, key)
+  def handle_cast({:cache, config, record_or_records, ttl}, state) do
+    records = table_insert(record_or_records, ttl, config)
+
+    handle_cast({:append_validators, config, records, ttl}, state)
+  end
+
+  def handle_cast({:clear_invalidator, _config, key}, %{invalidators: invalidators} = state) do
+    invalidators = clear_invalidator(key, invalidators)
 
     {:noreply, %{state | invalidators: invalidators}}
   end
 
-  @spec handle_cast({:refresh_invalidators, Config.t()}, map()) :: {:noreply, map()}
-  def handle_cast({:refresh_invalidators, config}, %{invalidators: invalidators} = state) do
-    clear_invalidators(invalidators)
+  def handle_cast({:delete, config, key}, state) do
+    key = table_delete(key, config)
 
-    {:noreply, %{state | invalidators: init_invalidators(config)}}
+    handle_cast({:clear_invalidator, config, key}, state)
+  end
+
+  def handle_cast({:refresh_invalidators, config}, %{invalidators: invalidators} = state) do
+    :mnesia.report_event({:refresh_invalidators, {@mnesia_cache_tab, {:pid, self()}}})
+
+    {:noreply, %{state | invalidators: init_invalidators(config, invalidators)}}
   end
 
   @impl GenServer
-  @spec handle_info({:invalidate, Config.t(), binary()}, map()) :: {:noreply, map()}
   def handle_info({:invalidate, config, key}, %{invalidators: invalidators} = state) do
-    invalidators = clear_invalidator(invalidators, key)
-    invalidators =
-      config
-      |> fetch(key)
-      |> delete_or_reschedule(config, invalidators)
+    invalidators = delete_or_reschedule(key, invalidators, config)
 
     {:noreply, %{state | invalidators: invalidators}}
   end
 
-  defp delete_or_reschedule(nil, _config, invalidators), do: invalidators
-  defp delete_or_reschedule({key, _value, key_config, expire}, config, invalidators) do
-    case Enum.max([expire - timestamp(), 0]) do
-      0 ->
-        table_delete(config, key)
-
+  defp delete_or_reschedule(key, invalidators, config) do
+    config
+    |> fetch(key)
+    |> case do
+      nil ->
         invalidators
-      ttl ->
-        update_invalidators(key_config, invalidators, key, ttl)
+
+      {_value, expire} ->
+        case Kernel.max(expire - timestamp(), 0) do
+          0 ->
+            key
+            |> table_delete(config)
+            |> clear_invalidator(invalidators)
+
+          ttl ->
+            :mnesia.report_event({:reschedule_invalidator, {@mnesia_cache_tab, key, {:pid, self()}}})
+            append_invalidator(key, invalidators, ttl, config)
+        end
     end
   end
 
-  defp update_invalidators(config, invalidators, key, ttl) do
-    invalidators = clear_invalidator(invalidators, key)
-    invalidator  = trigger_ttl(config, key, ttl)
+  defp append_invalidator(key, invalidators, ttl, config) do
+    invalidators = clear_invalidator(key, invalidators)
+    invalidator  = trigger_ttl(key, ttl, config)
 
     Map.put(invalidators, key, invalidator)
+  end
+
+  defp trigger_ttl(key, ttl, config) do
+    Process.send_after(self(), {:invalidate, config, key}, ttl)
   end
 
   defp refresh_invalidators_in_cluster(config) do
     :running_db_nodes
     |> :mnesia.system_info()
     |> Enum.reject(& &1 == node())
-    |> Enum.each(&:rpc.call(&1, GenServer, :cast, [__MODULE__, {:refresh_invalidators, config}]))
+    |> Enum.each(&GenServer.cast({__MODULE__, &1}, {:refresh_invalidators, config}))
   end
 
-  defp clear_invalidators(invalidators) do
-    Enum.reduce(invalidators, invalidators, fn {key, _ref}, invalidators ->
-      clear_invalidator(invalidators, key)
-    end)
-  end
-
-  defp clear_invalidator(invalidators, key) do
+  defp clear_invalidator(key, invalidators) do
     case Map.get(invalidators, key) do
       nil         -> nil
       invalidator -> Process.cancel_timer(invalidator)
     end
 
-    Map.drop(invalidators, [key])
+    Map.delete(invalidators, key)
   end
 
-  defp table_get(config, key) do
-    config
-    |> fetch(key)
-    |> case do
-      {_key, value, _config, _expire} -> value
-      nil                             -> :not_found
+  defp table_get(key, config) do
+    case fetch(config, key) do
+      {value, _expire} -> value
+      nil              -> :not_found
     end
   end
 
   defp fetch(config, key) do
     mnesia_key = mnesia_key(config, key)
-
-    {@mnesia_cache_tab, mnesia_key}
-    |> :mnesia.dirty_read()
-    |> case do
-      [{@mnesia_cache_tab, ^mnesia_key, {_key, value, config, expire}} | _rest] -> {key, value, config, expire}
-      [] -> nil
+    case :mnesia.dirty_read({@mnesia_cache_tab, mnesia_key}) do
+      [{@mnesia_cache_tab, ^mnesia_key, value}] -> value
+      []                                        -> nil
     end
   end
 
-  defp table_update(config, key, value, ttl) do
-    mnesia_key = mnesia_key(config, key)
-    expire     = timestamp() + ttl
-    value      = {key, value, config, expire}
+  defp table_all(key_match, config) do
+    mnesia_key_match = mnesia_key(config, key_match)
 
-    :mnesia.sync_transaction(fn ->
-      :mnesia.write({@mnesia_cache_tab, mnesia_key, value})
-    end)
+    @mnesia_cache_tab
+    |> :mnesia.dirty_select([{{@mnesia_cache_tab, mnesia_key_match, :_}, [], [:"$_"]}])
+    |> Enum.map(fn {@mnesia_cache_tab, key, {value, _expire}} -> {unwrap(key), value} end)
   end
 
-  defp table_delete(config, key) do
-    mnesia_key = mnesia_key(config, key)
+  defp unwrap([_namespace, key]), do: key
+  defp unwrap([_namespace | key]), do: key
 
-    :mnesia.sync_transaction(fn ->
-      :mnesia.delete({@mnesia_cache_tab, mnesia_key})
-    end)
+  defp table_insert(record_or_records, ttl, config) do
+    expire  = timestamp() + ttl
+    records = List.wrap(record_or_records)
+
+    {:atomic, _result} =
+      :mnesia.sync_transaction(fn ->
+        Enum.map(records, fn {key, value} ->
+          mnesia_key = mnesia_key(config, key)
+          value      = {value, expire}
+
+          :mnesia.write({@mnesia_cache_tab, mnesia_key, value})
+        end)
+      end)
+
+    records
   end
 
-  defp table_keys(config, opts \\ []) do
-    namespace = mnesia_key(config, "")
+  defp table_delete(key, config) do
+    {:atomic, key} =
+      :mnesia.sync_transaction(fn ->
+        mnesia_key = mnesia_key(config, key)
 
-    sync_all_keys()
-    |> Enum.filter(&String.starts_with?(&1, namespace))
-    |> maybe_remove_namespace(namespace, opts)
-  end
+        :mnesia.delete({@mnesia_cache_tab, mnesia_key})
 
-  defp sync_all_keys do
-    {:atomic, keys} = :mnesia.sync_transaction(fn ->
-      :mnesia.all_keys(@mnesia_cache_tab)
-    end)
+        key
+      end)
 
-    keys
-  end
-
-  defp maybe_remove_namespace(keys, namespace, opts) do
-    case Keyword.get(opts, :remove_namespace, true) do
-      true ->
-        start = String.length(namespace)
-        Enum.map(keys, &String.slice(&1, start..-1))
-
-      _ ->
-        keys
-    end
+    key
   end
 
   defp init_mnesia(config) do
-    config
-    |> find_active_cluster_nodes()
-    |> case do
+    case find_active_cluster_nodes(config) do
       []    -> init_cluster(config)
       nodes -> join_cluster(config, nodes)
     end
@@ -292,9 +320,15 @@ defmodule Pow.Store.Backend.MnesiaCache do
     visible_nodes = Node.list()
     db_nodes      = Config.get(config, :extra_db_nodes, [])
 
-    db_nodes
-    |> Enum.filter(& &1 in visible_nodes)
-    |> Enum.filter(&:rpc.block_call(&1, :mnesia, :system_info, [:is_running]) == :yes)
+    db_nodes =
+      case db_nodes do
+        {mod, fun, args} -> apply(mod, fun, args)
+        nodes -> nodes
+      end
+
+    Enum.filter(db_nodes, fn node ->
+      node in visible_nodes and :rpc.block_call(node, :mnesia, :system_info, [:is_running]) == :yes
+    end)
   end
 
   defp init_cluster(config) do
@@ -303,10 +337,12 @@ defmodule Pow.Store.Backend.MnesiaCache do
          :ok <- create_table(config),
          :ok <- wait_for_table(config) do
 
-      Logger.info("[#{inspect __MODULE__}] Mnesia cluster initiated on #{inspect node()}")
+      Logger.info("Mnesia cluster initiated on #{inspect node()}")
+
+      :ok
     else
       {:error, reason} ->
-        Logger.error("[inspect __MODULE__}] Couldn't initialize mnesia cluster because: #{inspect reason}")
+        Logger.error("Couldn't initialize mnesia cluster because: #{inspect reason}")
         {:error, reason}
     end
   end
@@ -319,12 +355,12 @@ defmodule Pow.Store.Backend.MnesiaCache do
          :ok <- sync_table(config, cluster_nodes),
          :ok <- wait_for_table(config) do
 
-      Logger.info("[#{inspect __MODULE__}] Joined mnesia cluster nodes #{inspect cluster_nodes} for #{inspect node()}")
+      Logger.info("Joined mnesia cluster nodes #{inspect cluster_nodes} for #{inspect node()}")
 
       :ok
     else
       {:error, reason} ->
-        Logger.error("[inspect __MODULE__}] Couldn't join mnesia cluster because: #{inspect reason}")
+        Logger.error("Couldn't join mnesia cluster because: #{inspect reason}")
         {:error, reason}
     end
   end
@@ -333,6 +369,7 @@ defmodule Pow.Store.Backend.MnesiaCache do
     case Application.start(:mnesia) do
       {:error, {:already_started, :mnesia}} -> :ok
       :ok                                   -> :ok
+      {:error, error}                       -> {:error, error}
     end
   end
 
@@ -354,6 +391,7 @@ defmodule Pow.Store.Backend.MnesiaCache do
     case :mnesia.change_table_copy_type(:schema, node(), copy_type) do
       {:atomic, :ok}                               -> :ok
       {:aborted, {:already_exists, :schema, _, _}} -> :ok
+      any                                          -> {:error, {:change_table_copy_type, any}}
     end
   end
 
@@ -370,11 +408,12 @@ defmodule Pow.Store.Backend.MnesiaCache do
 
   defp create_table(config) do
     table_opts = Config.get(config, :table_opts, [disc_copies: [node()]])
-    table_def  = Keyword.merge(table_opts, [type: :set])
+    table_def  = Keyword.merge(table_opts, [type: :ordered_set])
 
     case :mnesia.create_table(@mnesia_cache_tab, table_def) do
       {:atomic, :ok}                                   -> :ok
       {:aborted, {:already_exists, @mnesia_cache_tab}} -> :ok
+      any                                              -> {:error, {:create_table, any}}
     end
   end
 
@@ -384,7 +423,7 @@ defmodule Pow.Store.Backend.MnesiaCache do
     case :mnesia.add_table_copy(@mnesia_cache_tab, node(), copy_type) do
       {:atomic, :ok}                      -> :ok
       {:aborted, {:already_exists, _, _}} -> :ok
-      any                                 -> {:error, any}
+      any                                 -> {:error, {:add_table_copy, any}}
     end
   end
 
@@ -402,46 +441,69 @@ defmodule Pow.Store.Backend.MnesiaCache do
   end
 
   defp mnesia_key(config, key) do
-    namespace = Config.get(config, :namespace, "cache")
-
-    "#{namespace}:#{key}"
+    [namespace(config) | List.wrap(key)]
   end
 
-  defp init_invalidators(config) do
-    config
-    |> table_keys(remove_namespace: false)
-    |> Enum.map(&init_invalidator(config, &1))
-    |> Enum.reject(&is_nil/1)
-    |> Enum.into(%{})
+  defp namespace(config), do: Config.get(config, :namespace, "cache")
+
+  defp init_invalidators(config, existing_invalidators \\ %{}) do
+    clear_all_invalidators(existing_invalidators)
+
+    {:atomic, invalidators} =
+      :mnesia.sync_transaction(fn ->
+        :mnesia.foldl(fn
+          {@mnesia_cache_tab, key, {_value, expire}}, invalidators when is_list(key) ->
+            ttl = Enum.max([expire - timestamp(), 0])
+
+            key
+            |> unwrap()
+            |> append_invalidator(invalidators, ttl, config)
+
+          # TODO: Remove by 1.1.0
+          {@mnesia_cache_tab, key, {_key, _value, _config, expire}}, invalidators when is_binary(key) and is_number(expire) ->
+            Logger.warn("Deleting old record in the mnesia cache: #{inspect key}")
+
+            :mnesia.delete({@mnesia_cache_tab, key})
+
+            invalidators
+
+          {@mnesia_cache_tab, key, _value}, invalidators ->
+            Logger.warn("Found an unexpected record in the mnesia cache, please delete it: #{inspect key}")
+
+            invalidators
+        end,
+        %{},
+        @mnesia_cache_tab)
+      end)
+
+    invalidators
   end
 
-  defp init_invalidator(_config, key) do
-    {@mnesia_cache_tab, key}
-    |> :mnesia.dirty_read()
-    |> case do
-      [{@mnesia_cache_tab, ^key, {_key_id, _value, _config, nil}} | _rest] ->
-        nil
-
-      [{@mnesia_cache_tab, ^key, {key_id, _value, config, expire}} | _rest] ->
-        ttl = Enum.max([expire - timestamp(), 0])
-
-        {key, trigger_ttl(config, key_id, ttl)}
-
-      [] -> nil
-    end
-  end
-
-  defp trigger_ttl(config, key, ttl) do
-    Process.send_after(self(), {:invalidate, config, key}, ttl)
+  defp clear_all_invalidators(invalidators) do
+    invalidators
+    |> Map.keys()
+    |> Enum.reduce(invalidators, fn key, invalidators ->
+      clear_invalidator(key, invalidators)
+    end)
   end
 
   defp timestamp, do: :os.system_time(:millisecond)
 
-  defp ttl(config) do
-    Config.get(config, :ttl) || raise_ttl_error()
+  defp ttl!(config) do
+    Config.get(config, :ttl) || raise_ttl_error!()
   end
 
-  @spec raise_ttl_error :: no_return
-  defp raise_ttl_error,
+  @spec raise_ttl_error!() :: no_return()
+  defp raise_ttl_error!,
     do: Config.raise_error("`:ttl` configuration option is required for #{inspect(__MODULE__)}")
+
+  # TODO: Remove by 1.1.0
+  @deprecated "Use `put/2` instead"
+  @doc false
+  def put(config, key, value), do: put(config, {key, value})
+
+  # TODO: Remove by 1.1.0
+  @deprecated "Use `all/2` instead"
+  @doc false
+  def keys(config), do: all(config, :_)
 end

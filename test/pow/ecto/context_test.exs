@@ -7,6 +7,8 @@ defmodule Pow.Ecto.ContextTest do
     use Ecto.Schema
     use Pow.Ecto.Schema, password_hash_methods: {&__MODULE__.send_hash_password/1, &__MODULE__.send_verify_password/2}
 
+    @ecto_derive_inspect_for_redacted_fields false
+
     alias Pow.Ecto.Schema.Password
 
     schema "users" do
@@ -32,6 +34,12 @@ defmodule Pow.Ecto.ContextTest do
 
   @config [repo: Repo, user: User]
   @username_config [repo: Repo, user: UsernameUser]
+
+  defmodule CustomUsers do
+    use Context, repo: Repo, user: User
+
+    def get_by([email: :test]), do: %User{email: :ok, password_hash: Password.pbkdf2_hash("secret1234")}
+  end
 
   describe "authenticate/2" do
     @password "secret1234"
@@ -96,6 +104,13 @@ defmodule Pow.Ecto.ContextTest do
       assert Users.authenticate(:test_macro) == :ok
     end
 
+    test "with `:users_context`" do
+      params = Map.put(@valid_params, "email", :test)
+
+      assert %User{email: :ok} = Context.authenticate(params, @config ++ [users_context: CustomUsers])
+      assert %User{email: :ok} = CustomUsers.authenticate(params)
+    end
+
     test "prevents timing attack" do
       config = [repo: Repo, user: TimingAttackUser]
 
@@ -113,15 +128,14 @@ defmodule Pow.Ecto.ContextTest do
       "email" => "test@example.com",
       "custom" => "custom",
       "password" => @password,
-      "confirm_password" => @password
+      "password_confirmation" => @password
     }
 
     test "creates" do
-      assert {:error, _changeset} = Context.create(Map.delete(@valid_params, "confirm_password"), @config)
+      assert {:error, _changeset} = Context.create(Map.delete(@valid_params, "password_confirmation"), @config)
       assert {:ok, user} = Context.create(@valid_params, @config)
       assert user.custom == "custom"
       refute user.password
-      refute user.confirm_password
     end
 
     test "as `use Pow.Ecto.Context`" do
@@ -138,7 +152,7 @@ defmodule Pow.Ecto.ContextTest do
       "email" => "new@example.com",
       "custom" => "custom",
       "password" => "new_#{@password}",
-      "confirm_password" => "new_#{@password}",
+      "password_confirmation" => "new_#{@password}",
       "current_password" => @password
     }
 
@@ -155,7 +169,6 @@ defmodule Pow.Ecto.ContextTest do
       assert Context.authenticate(@valid_params, @config) == updated_user
       assert updated_user.custom == "custom"
       refute updated_user.password
-      refute updated_user.confirm_password
       refute updated_user.current_password
     end
 

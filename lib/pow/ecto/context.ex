@@ -5,7 +5,7 @@ defmodule Pow.Ecto.Context do
   ## Usage
 
   This module will be used by pow by default. If you
-  wish to have control over context methods, you can
+  wish to have control over context functions, you can
   do configure `lib/my_project/users/users.ex`
   the following way:
 
@@ -21,7 +21,7 @@ defmodule Pow.Ecto.Context do
 
   Remember to update configuration with `users_context: MyApp.Users`.
 
-  The following Pow methods can be accessed:
+  The following Pow functions can be accessed:
 
     * `pow_authenticate/1`
     * `pow_create/1`
@@ -35,24 +35,17 @@ defmodule Pow.Ecto.Context do
     * `:user` - the user schema module (required)
     * `:repo_opts` - keyword list options for the repo, `:prefix` can be set here
   """
-  alias Pow.Config
-  alias Pow.Ecto.Schema
+  alias Pow.{Config, Context, Ecto.Schema, Operations}
 
-  @type user :: map()
-  @type changeset :: map()
-
-  @callback authenticate(map()) :: user() | nil
-  @callback create(map()) :: {:ok, user()} | {:error, changeset()}
-  @callback update(user(), map()) :: {:ok, user()} | {:error, changeset()}
-  @callback delete(user()) :: {:ok, user()} | {:error, changeset()}
-  @callback get_by(Keyword.t() | map()) :: user() | nil
+  @type user :: Context.user()
+  @type changeset :: Context.changeset()
 
   @doc false
   defmacro __using__(config) do
     quote do
-      @behaviour unquote(__MODULE__)
+      @behaviour Context
 
-      @pow_config unquote(config)
+      @pow_config Keyword.put_new(unquote(config), :users_context, __MODULE__)
 
       def authenticate(params), do: pow_authenticate(params)
       def create(params), do: pow_create(params)
@@ -80,7 +73,7 @@ defmodule Pow.Ecto.Context do
         unquote(__MODULE__).get_by(clauses, @pow_config)
       end
 
-      defoverridable unquote(__MODULE__)
+      defoverridable Context
     end
   end
 
@@ -90,26 +83,26 @@ defmodule Pow.Ecto.Context do
   User schema module and repo module will be fetched from the config. The user
   id field is fetched from the user schema module.
 
-  The method will return nil if either the fetched user, or password is nil.
+  The function will return nil if either the fetched user or password is nil.
 
   To prevent timing attacks, a blank user struct will be passed to the
-  `verify_password/2` method for the user schema module to ensure that the
+  `verify_password/2` function for the user schema module to ensure that the
   the response time will be equal as when a password is verified.
   """
   @spec authenticate(map(), Config.t()) :: user() | nil
   def authenticate(params, config) do
     user_mod      = Config.user!(config)
     user_id_field = user_mod.pow_user_id_field()
-    login_value   = params[Atom.to_string(user_id_field)]
+    user_id_value = params[Atom.to_string(user_id_field)]
     password      = params["password"]
 
-    do_authenticate(user_id_field, login_value, password, config)
+    do_authenticate(user_id_field, user_id_value, password, config)
   end
 
   defp do_authenticate(_user_id_field, nil, _password, _config), do: nil
-  defp do_authenticate(user_id_field, login_value, password, config) do
-    [{user_id_field, login_value}]
-    |> get_by(config)
+  defp do_authenticate(user_id_field, user_id_value, password, config) do
+    [{user_id_field, user_id_value}]
+    |> Operations.get_by(config)
     |> verify_password(password, config)
   end
 
@@ -199,10 +192,9 @@ defmodule Pow.Ecto.Context do
   @spec do_insert(changeset(), Config.t()) :: {:ok, user()} | {:error, changeset()}
   def do_insert(changeset, config) do
     opts = repo_opts(config, [:prefix])
+    repo = Config.repo!(config)
 
-    changeset
-    |> Config.repo!(config).insert(opts)
-    |> reload_after_write(config)
+    repo.insert(changeset, opts)
   end
 
   @doc """
@@ -213,20 +205,9 @@ defmodule Pow.Ecto.Context do
   @spec do_update(changeset(), Config.t()) :: {:ok, user()} | {:error, changeset()}
   def do_update(changeset, config) do
     opts = repo_opts(config, [:prefix])
+    repo = Config.repo!(config)
 
-    changeset
-    |> Config.repo!(config).update(opts)
-    |> reload_after_write(config)
-  end
-
-  defp reload_after_write({:error, changeset}, _config), do: {:error, changeset}
-  defp reload_after_write({:ok, struct}, config) do
-    # When ecto updates/inserts, has_many :through associations are set to nil.
-    # So we'll just reload when writes happen.
-    opts = repo_opts(config, [:prefix])
-    struct = Config.repo!(config).get!(struct.__struct__, struct.id, opts)
-
-    {:ok, struct}
+    repo.update(changeset, opts)
   end
 
   # TODO: Remove by 1.1.0

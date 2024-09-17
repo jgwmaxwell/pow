@@ -9,13 +9,13 @@ defmodule Pow.Ecto.Schema.ChangesetTest do
     @valid_params %{
       "email" => "john.doe@example.com",
       "password" => "secret1234",
-      "confirm_password" => "secret1234",
+      "password_confirmation" => "secret1234",
       "custom" => "custom"
     }
     @valid_params_username %{
       "username" => "john.doe",
       "password" => "secret1234",
-      "confirm_password" => "secret1234"
+      "password_confirmation" => "secret1234"
     }
 
     test "requires user id" do
@@ -23,6 +23,10 @@ defmodule Pow.Ecto.Schema.ChangesetTest do
       assert changeset.valid?
 
       changeset = User.changeset(%User{}, Map.delete(@valid_params, "email"))
+      refute changeset.valid?
+      assert changeset.errors[:email] == {"can't be blank", [validation: :required]}
+
+      changeset = User.changeset(%User{email: "john.doe@example.com"}, %{email: nil})
       refute changeset.valid?
       assert changeset.errors[:email] == {"can't be blank", [validation: :required]}
 
@@ -37,7 +41,8 @@ defmodule Pow.Ecto.Schema.ChangesetTest do
     test "validates user id as email" do
       changeset = User.changeset(%User{}, Map.put(@valid_params, "email", "invalid"))
       refute changeset.valid?
-      assert changeset.errors[:email] == {"has invalid format", [validator: &Pow.Ecto.Schema.Changeset.validate_email/1, reason: "invalid format"]}
+      assert changeset.errors[:email] == {"has invalid format", [validation: :email_format, reason: "invalid format"]}
+      assert changeset.validations[:email] == {:email_format, &Pow.Ecto.Schema.Changeset.validate_email/1}
 
       changeset = User.changeset(%User{}, @valid_params)
       assert changeset.valid?
@@ -48,7 +53,8 @@ defmodule Pow.Ecto.Schema.ChangesetTest do
       changeset = Changeset.user_id_field_changeset(%User{}, @valid_params, config)
 
       refute changeset.valid?
-      assert changeset.errors[:email] == {"has invalid format", [validator: config[:email_validator], reason: "custom message john.doe@example.com"]}
+      assert changeset.errors[:email] == {"has invalid format", [validation: :email_format, reason: "custom message john.doe@example.com"]}
+      assert changeset.validations[:email] == {:email_format, config[:email_validator]}
 
       config    = [email_validator: fn _email -> :ok end]
       changeset = Changeset.user_id_field_changeset(%User{}, @valid_params, config)
@@ -86,7 +92,7 @@ defmodule Pow.Ecto.Schema.ChangesetTest do
         %User{}
         |> User.changeset(@valid_params)
         |> Repo.insert()
-      assert changeset.errors[:email] == {"has already been taken", [constraint: :unique, constraint_name: "users_email_index"]}
+      assert changeset.errors[:email] == {"has already been taken", constraint: :unique, constraint_name: "users_email_index"}
 
       {:ok, _user} =
         %UsernameUser{}
@@ -97,7 +103,7 @@ defmodule Pow.Ecto.Schema.ChangesetTest do
         %UsernameUser{}
         |> UsernameUser.changeset(@valid_params_username)
         |> Repo.insert()
-      assert changeset.errors[:username] == {"has already been taken", [constraint: :unique, constraint_name: "users_username_index"]}
+      assert changeset.errors[:username] == {"has already been taken", constraint: :unique, constraint_name: "users_username_index"}
     end
 
     test "requires password when password_hash is nil" do
@@ -139,10 +145,10 @@ defmodule Pow.Ecto.Schema.ChangesetTest do
     end
 
     test "can confirm and hash password" do
-      changeset = User.changeset(%User{}, Map.put(@valid_params, "confirm_password", "invalid"))
+      changeset = User.changeset(%User{}, Map.put(@valid_params, "password_confirmation", "invalid"))
 
       refute changeset.valid?
-      assert changeset.errors[:confirm_password] == {"not same as password", []}
+      assert changeset.errors[:password_confirmation] == {"does not match confirmation", [validation: :confirmation]}
       refute changeset.changes[:password_hash]
 
       changeset = User.changeset(%User{}, @valid_params)
@@ -152,7 +158,59 @@ defmodule Pow.Ecto.Schema.ChangesetTest do
       assert Password.pbkdf2_verify("secret1234", changeset.changes[:password_hash])
     end
 
-    test "can use custom password hash methods" do
+    test "only validates password hash when no previous errors" do
+      params = Map.drop(@valid_params, ["email"])
+      changeset = User.changeset(%User{}, params)
+
+      refute changeset.valid?
+      refute changeset.errors[:password_hash]
+
+      params = Map.drop(@valid_params, ["password"])
+      changeset = User.changeset(%User{}, params)
+
+      refute changeset.valid?
+      refute changeset.errors[:password_hash]
+
+      params = Map.drop(@valid_params, ["password"])
+      changeset = User.changeset(%User{}, params)
+
+      refute changeset.valid?
+      refute changeset.errors[:password_hash]
+
+      config = [password_hash_methods: {fn _ -> nil end, & &1}]
+      changeset = Changeset.password_changeset(%User{}, @valid_params, config)
+
+      refute changeset.valid?
+      assert changeset.errors[:password_hash] == {"can't be blank", [validation: :required]}
+    end
+
+    alias ExUnit.CaptureIO
+
+    # TODO: Remove by 1.1.0
+    test "handle `confirm_password` conversion" do
+      params =
+        @valid_params
+        |> Map.delete("password_confirmation")
+        |> Map.put("confirm_password", "secret1234")
+
+      assert CaptureIO.capture_io(:stderr, fn ->
+        changeset = User.changeset(%User{}, params)
+
+        assert changeset.valid?
+      end) =~ "passing `confirm_password` value to `Pow.Ecto.Schema.Changeset.confirm_password_changeset/3` has been deprecated, please use `password_confirmation` instead"
+
+      params = Map.put(params, "confirm_password", "invalid")
+
+      assert CaptureIO.capture_io(:stderr, fn ->
+        changeset = User.changeset(%User{}, params)
+
+        refute changeset.valid?
+        assert changeset.errors[:confirm_password] == {"does not match confirmation", [validation: :confirmation]}
+        refute changeset.errors[:password_confirmation]
+      end) =~ "passing `confirm_password` value to `Pow.Ecto.Schema.Changeset.confirm_password_changeset/3` has been deprecated, please use `password_confirmation` instead"
+    end
+
+    test "can use custom password hash functions" do
       password_hash = &(&1 <> "123")
       password_verify = &(&1 == &2 <> "123")
       config = [password_hash_methods: {password_hash, password_verify}]
@@ -179,7 +237,8 @@ defmodule Pow.Ecto.Schema.ChangesetTest do
 
       changeset = User.changeset(user, Map.put(@valid_params, "current_password", "invalid"))
       refute changeset.valid?
-      assert changeset.errors[:current_password] == {"is invalid", []}
+      assert changeset.errors[:current_password] == {"is invalid", [validation: :verify_password]}
+      assert changeset.validations[:current_password] == {:verify_password, []}
 
       changeset = User.changeset(user, Map.put(@valid_params, "current_password", "secret1234"))
       assert changeset.valid?
@@ -227,18 +286,31 @@ defmodule Pow.Ecto.Schema.ChangesetTest do
   end
 
   test "validate_email/1" do
-    # Format
+    # Local-part and domain from https://en.wikipedia.org/wiki/Email_address#Syntax
+    assert Changeset.validate_email("John..Doe@example.com") == {:error, "consective dots in local-part"}
+    assert Changeset.validate_email("\".John.Doe\"@example.com") == :ok
+    assert Changeset.validate_email("\"John.Doe.\"@example.com") == :ok
+    assert Changeset.validate_email("\"John..Doe\"@example.com") == :ok
+    assert Changeset.validate_email("john.smith(comment)@example.com") == :ok
+    assert Changeset.validate_email("(comment)john.smith@example.com") == :ok
+    assert Changeset.validate_email("john.smith@(comment)example.com") == :ok
+    assert Changeset.validate_email("john.smith@example.com(comment)") == :ok
+
+    # Examples from https://en.wikipedia.org/wiki/Email_address#Examples
     assert Changeset.validate_email("simple@example.com") == :ok
     assert Changeset.validate_email("very.common@example.com") == :ok
     assert Changeset.validate_email("disposable.style.email.with+symbol@example.com") == :ok
     assert Changeset.validate_email("other.email-with-hyphen@example.com") == :ok
     assert Changeset.validate_email("fully-qualified-domain@example.com") == :ok
+    assert Changeset.validate_email("user.name+tag+sorting@example.com") == :ok
     assert Changeset.validate_email("x@example.com") == :ok
     assert Changeset.validate_email("example-indeed@strange-example.com") == :ok
     assert Changeset.validate_email("admin@mailserver1") == :ok
     assert Changeset.validate_email("example@s.example") == :ok
     assert Changeset.validate_email("\" \"@example.org") == :ok
     assert Changeset.validate_email("\"john..doe\"@example.org") == :ok
+    assert Changeset.validate_email("mailhost!username@example.org") == :ok
+    assert Changeset.validate_email("user%example.com@example.org") == :ok
 
     assert Changeset.validate_email("Abc.example.com") == {:error, "invalid format"}
     assert Changeset.validate_email("A@b@c@example.com") == {:error, "invalid characters in local-part"}
@@ -247,19 +319,55 @@ defmodule Pow.Ecto.Schema.ChangesetTest do
     assert Changeset.validate_email("this is\"not\\allowed@example.com") == {:error, "invalid characters in local-part"}
     assert Changeset.validate_email("this\\ still\\\"not\\\\allowed@example.com") == {:error, "invalid characters in local-part"}
     assert Changeset.validate_email("1234567890123456789012345678901234567890123456789012345678901234+x@example.com") == {:error, "local-part too long"}
+    assert Changeset.validate_email("i_like_underscore@but_its_not_allow_in_this_part.example.com") == {:error, "invalid characters in dns label"}
 
-    # Unicode
+    # Unicode from https://en.wikipedia.org/wiki/Email_address#Internationalization_examples
     assert Changeset.validate_email("Pelé@example.com") == :ok
     assert Changeset.validate_email("δοκιμή@παράδειγμα.δοκιμή") == :ok
     assert Changeset.validate_email("我買@屋企.香港") == :ok
     assert Changeset.validate_email("二ノ宮@黒川.日本") == :ok
     assert Changeset.validate_email("медведь@с-балалайкой.рф") == :ok
+    assert Changeset.validate_email("संपर्क@डाटामेल.भारत") == :ok
 
-    # All error cases
+    # Test cases from https://tools.ietf.org/html/rfc3696#section-3
+    # Quote issues corrected with https://www.rfc-editor.org/errata/rfc3696
+    assert Changeset.validate_email("\"Abc\\@def\"@example.com") == :ok
+    assert Changeset.validate_email("\"Fred\\ Bloggs\"@example.com") == :ok
+    assert Changeset.validate_email("\"Joe.\\\\Blow\"@example.com") == :ok
+    assert Changeset.validate_email("\"Abc@def\"@example.com") == :ok
+    assert Changeset.validate_email("\"Fred Bloggs\"@example.com") == :ok
+    assert Changeset.validate_email("user+mailbox@example.com") == :ok
+    assert Changeset.validate_email("customer/department=shipping@example.com") == :ok
+    assert Changeset.validate_email("$A12345@example.com") == :ok
+    assert Changeset.validate_email("!def!xyz%abc@example.com") == :ok
+    assert Changeset.validate_email("_somename@example.com") == :ok
+
+    # IP not allowed
+    refute Changeset.validate_email("jsmith@[192.168.2.1]") == :error
+    refute Changeset.validate_email("jsmith@[IPv6:2001:db8::1]") == :error
+
+    # Other successs cases
+    assert Changeset.validate_email("john.doe@#{String.duplicate("x", 63)}.#{String.duplicate("x", 63)}.#{String.duplicate("x", 63)}.#{String.duplicate("x", 63)}") == :ok
+    assert Changeset.validate_email("john.doe@1.2.com") == :ok
+    assert Changeset.validate_email("john.doe@example.x1") == :ok
+    assert Changeset.validate_email("john.doe@sub-domain-with-hyphen.domain-with-hyphen.com") == :ok
+
+    # Other error cases
+    assert Changeset.validate_email("noatsign") == {:error, "invalid format"}
     assert Changeset.validate_email("john..doe@example.com") == {:error, "consective dots in local-part"}
-    assert Changeset.validate_email("john.doe@#{String.duplicate("x", 256)}") == {:error, "domain too long"}
-    assert Changeset.validate_email("john.doe@-example.com") == {:error, "domain begins with hyphen"}
-    assert Changeset.validate_email("john.doe@example-") == {:error, "domain ends with hyphen"}
-    assert Changeset.validate_email("john.doe@invaliddomain$") == {:error, "invalid characters in domain"}
+    assert Changeset.validate_email("john.doe@#{String.duplicate("x", 63)}.#{String.duplicate("x", 63)}.#{String.duplicate("x", 63)}.#{String.duplicate("x", 60)}.com") == {:error, "domain too long"}
+    assert Changeset.validate_email("john.doe@-example.com") == {:error, "dns label begins with hyphen"}
+    assert Changeset.validate_email("john.doe@-example.example.com") == {:error, "dns label begins with hyphen"}
+    assert Changeset.validate_email("john.doe@example-.com") == {:error, "dns label ends with hyphen"}
+    assert Changeset.validate_email("john.doe@example-.example.com") == {:error, "dns label ends with hyphen"}
+    assert Changeset.validate_email("john.doe@invaliddomain$") == {:error, "invalid characters in dns label"}
+    assert Changeset.validate_email("john(comment)doe@example.com") == {:error, "invalid characters in local-part"}
+    assert Changeset.validate_email("johndoe@example(comment).com") == {:error, "invalid characters in dns label"}
+    assert Changeset.validate_email("john.doe@.") == {:error, "dns label is too short"}
+    assert Changeset.validate_email("john.doe@.com") == {:error, "dns label is too short"}
+    assert Changeset.validate_email("john.doe@example.") == {:error, "dns label is too short"}
+    assert Changeset.validate_email("john.doe@example.1") == {:error, "tld cannot be all-numeric"}
+    assert Changeset.validate_email("john.doe@#{String.duplicate("x", 64)}.com") == {:error, "dns label too long"}
+    assert Changeset.validate_email("john.doe@#{String.duplicate("x", 64)}.example.com") == {:error, "dns label too long"}
   end
 end

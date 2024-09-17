@@ -1,4 +1,9 @@
+Application.put_env(:mnesia, :dir, 'tmp/mnesia')
+Application.ensure_all_started(:mnesia)
+
 Logger.configure(level: :warn)
+
+:ok = Supervisor.terminate_child(Pow.Supervisor, Pow.Store.Backend.EtsCache)
 
 ExUnit.start()
 
@@ -30,4 +35,4 @@ for extension <- Application.get_env(:pow, :extension_test_modules) do
 end
 
 # Make sure we can run distribution tests
-:os.cmd('epmd -daemon')
+System.cmd("epmd", ["-daemon"])

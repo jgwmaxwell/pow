@@ -6,15 +6,18 @@ defmodule PowInvitation.Ecto.SchemaTest do
   alias PowInvitation.PowEmailConfirmation.Test.Users.User, as: UserEmailConfirmation
   alias PowInvitation.Test.Users.User
 
-  defmodule OverrideInviteChangesetUser do
+  defmodule OverridenChangesetsUser do
     @moduledoc false
     use Ecto.Schema
     use Pow.Ecto.Schema
     use Pow.Extension.Ecto.Schema,
       extensions: [PowInvitation]
 
+    @ecto_derive_inspect_for_redacted_fields false
+
     schema "users" do
       field :organization_id, :integer
+      field :invitation_accepted_ip, :string
 
       pow_user_fields()
 
@@ -25,6 +28,12 @@ defmodule PowInvitation.Ecto.SchemaTest do
       user_or_changeset
       |> pow_invite_changeset(invited_by, params)
       |> Ecto.Changeset.put_change(:organization_id, 1)
+    end
+
+    def accept_invitation_changeset(user_or_changeset, params) do
+      user_or_changeset
+      |> pow_accept_invitation_changeset(params)
+      |> Ecto.Changeset.put_change(:invitation_accepted_ip, "127.0.0.1")
     end
   end
 
@@ -58,8 +67,8 @@ defmodule PowInvitation.Ecto.SchemaTest do
       assert changeset.errors[:email]
     end
 
-    test "with overridden method" do
-      changeset = OverrideInviteChangesetUser.invite_changeset(%OverrideInviteChangesetUser{}, @invited_by, @valid_params)
+    test "with overridden changesets" do
+      changeset = OverridenChangesetsUser.invite_changeset(%OverridenChangesetsUser{}, @invited_by, @valid_params)
 
       assert changeset.valid?
       assert changeset.changes.organization_id == 1
@@ -68,7 +77,7 @@ defmodule PowInvitation.Ecto.SchemaTest do
 
   describe "accept_invitation_changeset/2" do
     @password "password12"
-    @valid_params %{email: "test@example.com", password: @password, confirm_password: @password}
+    @valid_params %{email: "test@example.com", password: @password, password_confirmation: @password}
     @invalid_params %{email: "foo"}
 
     test "with valid params" do
@@ -101,6 +110,13 @@ defmodule PowInvitation.Ecto.SchemaTest do
       assert changeset.valid?
       assert changeset.changes[:email_confirmation_token]
       assert changeset.changes[:unconfirmed_email] == "new@example.com"
+    end
+
+    test "with overridden changesets" do
+      changeset = OverridenChangesetsUser.accept_invitation_changeset(%OverridenChangesetsUser{}, @valid_params)
+
+      assert changeset.valid?
+      assert changeset.changes.invitation_accepted_ip == "127.0.0.1"
     end
   end
 end
